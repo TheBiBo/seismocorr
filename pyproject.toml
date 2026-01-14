@@ -1,0 +1,44 @@
+# pyproject.toml
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seismocorr"
+version = "0.1.0"
+description = "A scalable framework for seismic cross-correlation"
+authors = [{name = "Fu Tao", email = "1447805660@qq.com"}]
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Geophysics",
+]
+dependencies = [
+    "numpy>=1.20.0",
+    "scipy>=1.7.0",
+    "h5py>=3.0.0",
+    "numba>=0.55.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+]
+examples = [
+    "matplotlib>=3.4.0",
+    "tqdm>=4.60.0",
+    "psutil>=5.8.0",
+    "pandas>=1.3.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]  # 告诉 setuptools 在哪里找包
+include = ["seismocorr*"]
+
+[project.scripts]
+seismocorr-run = "seismocorr.cli:main"  # 可选 CLI
