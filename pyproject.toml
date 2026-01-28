@@ -10,7 +10,7 @@ version = "0.1.1"
 description = "A scalable framework for seismic cross-correlation"
 authors = [{name = "Fu Tao", email = "1447805660@qq.com"},
            {name = "He Chengtian", email = "zg_hct@163.com"},
-           {name = "Xu Xiangyang", email = "1447805660@qq.com"},
+           {name = "Xu Xiangyang", email = "2023708357@qq.com"},
            {name = "Jiang Yi", email = "1447805660@qq.com"}]
 readme = "README.md"
 requires-python = ">=3.9"
@@ -28,6 +28,7 @@ dependencies = [
     "numba>=0.55.0",
     "PyWavelets>=1.8.0",
     "PyYAML>=0.2.5",
+    "plotly>=5.0.0",
 ]
 
 [project.optional-dependencies]
