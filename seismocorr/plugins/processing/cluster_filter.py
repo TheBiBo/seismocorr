@@ -1,35 +1,31 @@
-#seismocorr/plugins/processing/cluster_filter.py
 """
-聚类筛选器模块（基于组合距离进行样本筛选）。
+Cluster-like sequencing filter for pre-stacked NCF/CCF segments.
 
-数据约定：
-    - lags: (n_lags,)，延时范围。
-    - ccfs: (n_samples, n_lags)，Cross-Correlation Functions（CCFs）矩阵。
-    - keys: (n_samples,)，样本的标识符（可选）。
+依据论文描述实现“集相邻/排序”思想：
+1) 对每条 NCF 在指定 lag_window 内取窗；
+2) 对窗内波形做归一化，并统一加常数保证非负（用于距离计算的分布化）；
+3) 计算两两距离：EMD(=1D Wasserstein-1) 与 Energy distance（基于CDF差异）；
+4) 通过“相邻聚集”序列化：把相似的 NCF 排到相邻（贪心两端扩展）；
+5) 计算因果支到时（arrival time）并在排序序列上按百分位区间选择稳定片段；
+6) 返回“处理后的预叠加片段”（不做叠加），并提供 stacking.py 所需的 ccf_list 转换接口。
 
-功能：
-    - ClusterFilter：根据给定的组合距离度量（包括 EMD 和 Energy Distance），
-      对多个样本的 CCFs 进行筛选，选出符合条件的稳定片段。
-      输出经过筛选后的延时（lags）、CCFs 以及样本标识符。
-    
-    - 核心方法：
-      - fit：计算距离矩阵、生成排序 order、计算到时 arrival_times，并选择稳定片段的索引。
-      - transform：返回筛选后的 CCFs（支持不重复传入 lags/ccfs）。
-      - filter：结合 fit 和 transform 的一站式接口，执行整个筛选过程。
-      - filter_to_list：返回 stacking.py 所需的 CCF 列表。
-      
-    - 支持的计算：
-      - 使用 EMD 和 Energy distance 对样本进行匹配度量，构造距离矩阵。
-      - 基于贪心算法对距离矩阵进行排序，尽量将相似的样本排列在一起。
-      - 可选的到时计算：使用包络（Hilbert）方法计算 CCF 的到时。
-      - 基于设定的百分比选择筛选后的样本。
+输入适配 seismocorr/core/correlation.py：
+- lags: shape=(n_lags,)
+- ccfs: shape=(n_windows, n_lags)
+
+本文件不包含上游预处理（如带通滤波、时间/频率域归一化等），
+仅对“用于距离/排序/筛选”的 NCF 片段做分布化归一化。
 """
 
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from typing import Optional, Tuple, Sequence, List, Any, Dict
 
 
+@dataclass
 class ClusterFilter:
     """
     “集相邻/排序”滤波器：返回处理后的预叠加片段（不做叠加）。
@@ -40,31 +36,29 @@ class ClusterFilter:
     - filter_to_list: 一站式返回 stacking.py 需要的 ccf_list
     """
 
-    def __init__(
-        self,
-        lag_window: Optional[Tuple[float, float]] = (-1.5, 1.5),
-        add_constant: float = 1e-6,
-        emd_weight: float = 1.0,
-        energy_weight: float = 1.0,
-        select_percentile: Tuple[float, float] = (0.55, 0.85),
-        arrival_window: Optional[Tuple[float, float]] = None,
-        arrival_use_envelope: bool = True,
-    ):
-        self.lag_window = lag_window
-        self.add_constant = add_constant
-        self.emd_weight = emd_weight
-        self.energy_weight = energy_weight
-        self.select_percentile = select_percentile
-        self.arrival_window = arrival_window
-        self.arrival_use_envelope = arrival_use_envelope
-        self.order_ = None
-        self.arrival_times_ = None
-        self.selected_indices_ = None
-        self.distance_matrix_ = None
-        self.info_ = None
-        self._lags_cache = None
-        self._ccfs_cache = None
-        self._keys_cache = None
+    lag_window: Optional[Tuple[float, float]] = (-1.5, 1.5)
+
+    add_constant: float = 1e-6
+    emd_weight: float = 1.0
+    energy_weight: float = 1.0
+
+    select_percentile: Tuple[float, float] = (0.55, 0.85)
+
+    arrival_window: Optional[Tuple[float, float]] = None
+    arrival_use_envelope: bool = True
+
+    order_: Optional[np.ndarray] = None
+    arrival_times_: Optional[np.ndarray] = None
+    selected_indices_: Optional[np.ndarray] = None
+    distance_matrix_: Optional[np.ndarray] = None
+    info_: Optional[Dict[str, Any]] = None
+
+    # 缓存最近一次输入，简化 transform 调用
+    _lags_cache: Optional[np.ndarray] = None
+    _ccfs_cache: Optional[np.ndarray] = None
+    _keys_cache: Optional[List[str]] = None
+
+    # --------------------------- 基础工具：输出适配 stacking.py ---------------------------
 
     @staticmethod
     def as_ccf_list(ccfs_2d: np.ndarray) -> List[np.ndarray]:
@@ -94,14 +88,16 @@ class ClusterFilter:
         if n % 2 == 0:
             h[0] = 1.0
             h[n // 2] = 1.0
-            h[1:n // 2] = 2.0
+            h[1 : n // 2] = 2.0
         else:
             h[0] = 1.0
-            h[1:(n + 1) // 2] = 2.0
+            h[1 : (n + 1) // 2] = 2.0
 
         Z = X * h[None, :]
         z = np.fft.ifft(Z, axis=1)
         return np.abs(z)
+
+    # --------------------------- 论文距离：EMD 与 Energy distance ---------------------------
 
     @staticmethod
     def _to_nonnegative_distribution(
@@ -130,9 +126,9 @@ class ClusterFilter:
     def emd_1d_wasserstein1(p: np.ndarray, q: np.ndarray, dx: float = 1.0) -> float:
         """
         1D Earth Mover's Distance（等价于 Wasserstein-1）：
-        EMD = ∫ |CDF_p - CDF_q| dx
+          EMD = ∫ |CDF_p - CDF_q| dx
         离散等距采样时：
-        EMD ≈ sum_i |cdf_p[i] - cdf_q[i]| * dx
+          EMD ≈ sum_i |cdf_p[i] - cdf_q[i]| * dx
         """
         p = np.asarray(p, dtype=float)
         q = np.asarray(q, dtype=float)
@@ -145,8 +141,8 @@ class ClusterFilter:
     @staticmethod
     def energy_distance_1d(p: np.ndarray, q: np.ndarray, dx: float = 1.0) -> float:
         """
-        1D Energy distance（基于 CDF 差异的形式）： 
-        D = sqrt( 2 * ∫ (F-G)^2 dx )
+        1D Energy distance（基于 CDF 差异的形式）：
+          D = sqrt( 2 * ∫ (F-G)^2 dx )
         """
         p = np.asarray(p, dtype=float)
         q = np.asarray(q, dtype=float)
@@ -157,8 +153,9 @@ class ClusterFilter:
         val = 2.0 * np.sum((cdf_p - cdf_q) ** 2) * dx
         return float(np.sqrt(max(val, 0.0)))
 
-    @staticmethod
+    @classmethod
     def combined_distance(
+        cls,
         a: np.ndarray,
         b: np.ndarray,
         dx: float = 1.0,
@@ -169,14 +166,15 @@ class ClusterFilter:
         """
         组合距离：emd_weight*EMD + energy_weight*EnergyDistance
         """
-        pa = ClusterFilter._to_nonnegative_distribution(a, add_constant=add_constant)
-        pb = ClusterFilter._to_nonnegative_distribution(b, add_constant=add_constant)
-        d1 = ClusterFilter.emd_1d_wasserstein1(pa, pb, dx=dx)
-        d2 = ClusterFilter.energy_distance_1d(pa, pb, dx=dx)
+        pa = cls._to_nonnegative_distribution(a, add_constant=add_constant)
+        pb = cls._to_nonnegative_distribution(b, add_constant=add_constant)
+        d1 = cls.emd_1d_wasserstein1(pa, pb, dx=dx)
+        d2 = cls.energy_distance_1d(pa, pb, dx=dx)
         return float(emd_weight * d1 + energy_weight * d2)
 
+    @classmethod
     def pairwise_distance_matrix(
-        self,
+        cls,
         X: np.ndarray,
         dx: float = 1.0,
         add_constant: float = 1e-6,
@@ -194,7 +192,7 @@ class ClusterFilter:
         D = np.zeros((N, N), dtype=float)
         for i in range(N):
             for j in range(i + 1, N):
-                d = ClusterFilter.combined_distance(
+                d = cls.combined_distance(
                     X[i],
                     X[j],
                     dx=dx,
@@ -206,7 +204,10 @@ class ClusterFilter:
                 D[j, i] = d
         return D
 
-    def greedy_end_extension_order(self, D: np.ndarray) -> np.ndarray:
+    # --------------------------- “集相邻”：序列化（seriation/sequencing） ---------------------------
+
+    @staticmethod
+    def greedy_end_extension_order(D: np.ndarray) -> np.ndarray:
         """
         贪心两端扩展构造序列，使相似样本尽量相邻。
         返回：order（长度 N 的索引序列）
@@ -246,7 +247,100 @@ class ClusterFilter:
                 right = i_r
 
         return np.array(order, dtype=int)
-    
+
+    # --------------------------- 因果支到时（arrival time） ---------------------------
+
+    @classmethod
+    def causal_arrival_time(
+        cls,
+        lags: np.ndarray,
+        ccf: np.ndarray,
+        search_window: Optional[Tuple[float, float]] = None,
+        use_envelope: bool = True,
+    ) -> float:
+        """
+        计算单条 CCF/NCF 因果支到时：
+        - 只在 lags >= 0 的部分搜索
+        - search_window=(t0,t1) 限定搜索范围（单位秒）
+        - use_envelope=True 使用包络峰值，否则使用绝对振幅峰值
+        """
+        lags = np.asarray(lags, dtype=float)
+        x = np.asarray(ccf, dtype=float)
+        if lags.ndim != 1 or x.ndim != 1 or lags.size != x.size:
+            raise ValueError("lags 与 ccf 必须为同长度一维数组")
+
+        mask = lags >= 0.0
+        if search_window is not None:
+            t0, t1 = search_window
+            if t0 > t1:
+                t0, t1 = t1, t0
+            mask = mask & (lags >= t0) & (lags <= t1)
+
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            return float("nan")
+
+        seg = x[idx][None, :]
+        if use_envelope:
+            amp = cls.analytic_envelope(seg)[0]
+        else:
+            amp = np.abs(seg[0])
+
+        k = int(np.argmax(amp))
+        return float(lags[idx[k]])
+
+    @classmethod
+    def batch_causal_arrival_times(
+        cls,
+        lags: np.ndarray,
+        ccfs: np.ndarray,
+        search_window: Optional[Tuple[float, float]] = None,
+        use_envelope: bool = True,
+    ) -> np.ndarray:
+        """
+        批量计算每条 CCF/NCF 的因果支到时。
+        """
+        lags = np.asarray(lags, dtype=float)
+        X = np.asarray(ccfs, dtype=float)
+        if X.ndim != 2:
+            raise ValueError(f"ccfs 必须为二维数组 (N, n_lags)，当前 shape={X.shape}")
+        if lags.ndim != 1 or lags.size != X.shape[1]:
+            raise ValueError("lags 长度必须等于 ccfs 的第二维")
+
+        out = np.full(X.shape[0], np.nan, dtype=float)
+        for i in range(X.shape[0]):
+            out[i] = cls.causal_arrival_time(
+                lags, X[i], search_window=search_window, use_envelope=use_envelope
+            )
+        return out
+
+    def _validate_inputs(self, lags: np.ndarray, ccfs: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """输入有效性检查"""
+        lags = np.asarray(lags, dtype=float)
+        ccfs = np.asarray(ccfs, dtype=float)
+        if lags.ndim != 1:
+            raise ValueError(f"lags 必须为一维数组，当前 shape={lags.shape}")
+        if ccfs.ndim != 2:
+            raise ValueError(f"ccfs 必须为二维数组 (N, n_lags)，当前 shape={ccfs.shape}")
+        if lags.size != ccfs.shape[1]:
+            raise ValueError(f"lags 长度({lags.size}) 必须等于 ccfs 第二维({ccfs.shape[1]})")
+        if ccfs.shape[0] < 2:
+            raise ValueError("至少需要 2 条片段用于排序。")
+        return lags, ccfs
+
+    def _window_slice(self, lags: np.ndarray) -> slice:
+        """根据给定的滞后时间窗口（lag_window），选择一个有效的时间区间，并返回对应的切片（slice）。"""
+        if self.lag_window is None:
+            return slice(0, lags.size)
+        t0, t1 = self.lag_window
+        if t0 > t1:
+            t0, t1 = t1, t0
+        i0 = int(np.searchsorted(lags, t0, side="left"))
+        i1 = int(np.searchsorted(lags, t1, side="right"))
+        i0 = max(0, min(lags.size - 1, i0))
+        i1 = max(i0 + 1, min(lags.size, i1))
+        return slice(i0, i1)
+
     def fit(
         self,
         lags: np.ndarray,
@@ -402,6 +496,8 @@ class ClusterFilter:
         out_lags, out_ccfs, out_keys = self.transform(lags=lags, ccfs=ccfs, keys=keys)
         return self.as_ccf_list(out_ccfs)
 
+    # -------------------- 一站式简化接口 --------------------
+
     def filter(
         self,
         lags: np.ndarray,
@@ -447,4 +543,3 @@ class ClusterFilter:
         if self.info_ is None:
             return {}
         return dict(self.info_)
-   
