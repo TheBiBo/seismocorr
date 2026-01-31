@@ -1,9 +1,11 @@
+
 from __future__ import annotations
 
 from typing import Any, Dict
 
 import numpy as np
-
+import sys
+sys.path.append(r"C:\Users\Admin\Desktop\成像python包\seismocorr")
 from seismocorr.visualization import help_plot, plot, set_default_backend, show
 
 # =========================
@@ -145,6 +147,22 @@ def generate_seismic_data(
     return {"traces": traces, "time": time, "labels": labels}
 
 
+def generate_velocity_data() -> np.ndarray:
+    """生成1D速度结构数据。"""
+    # 层厚度 (单位：米)
+    thickness = np.array([100, 200, 300, 400, 500])  # 示例层厚度，单位米
+
+    # 不同速度模型的速度值 (单位：m/s)
+    velocity_model_1 = np.array([1500, 1700, 1900, 2100, 2300])  # 模型1的速度值
+    velocity_model_2 = np.array([1600, 1800, 2000, 2200, 2400])  # 模型2的速度值
+
+    # 将层厚度和速度值组合成2D数组
+    # 第一列为层厚度，后续列为每个模型的速度值
+    data = np.vstack([thickness, velocity_model_1, velocity_model_2]).T  # 转置以符合 (n, m) 格式
+
+    return data
+
+
 # =========================
 # 绘图测试
 # =========================
@@ -222,7 +240,6 @@ def test_seismic_waveform_plot() -> None:
     # 生成地震波形数据
     seismic_data = generate_seismic_data()
 
-    # 绘制地震波形图
     fig = plot(
         "lines",  # 使用 line 插件绘制波形图
         data={"x": seismic_data["time"], "y": seismic_data["traces"]},
@@ -232,8 +249,7 @@ def test_seismic_waveform_plot() -> None:
         x_lim=[0, 20],  # 设置 x 轴范围
         y_lim=[-2, 2],  # 设置 y 轴范围
         colors = ["blue","black"],
-        labels = ["s1", "s2"]
-    )
+        labels = ["s1", "s2"] )
 
     # 显示图形
     show(fig)
@@ -242,12 +258,41 @@ def test_seismic_waveform_plot() -> None:
     print(help_plot("lines"))  # 根据插件 id 调用 help_plot 获取帮助信息
 
 
+def test_velocity_structure_1d_plot() -> None:
+    """测试并绘制1D速度结构图。"""
+    set_default_backend("mpl")  # 设置默认后端为 matplotlib
+
+    # 生成1D速度结构数据
+    velocity_data = generate_velocity_data()
+
+    # 绘制1D速度结构图
+    fig = plot(
+        "vel1d",  # 使用 vel1d 插件绘制1D速度结构图
+        data=velocity_data,  # 数据格式：二维数组，第一列为层厚，后续列为每条曲线的速度值
+        title="1D Velocity Structure",  # 设置图标题
+        x_label="Velocity (m/s)",  # 设置 x 轴标签
+        y_label="Depth (m)",  # 设置 y 轴标签
+        x_lim=[1500, 2000],  # 设置 x 轴范围
+        y_lim=[350, 0],  # 设置 y 轴范围（深度向下）
+        colors=["blue", "green"],  # 设置两条曲线的颜色
+        labels=["Model 1", "Model 2"],  # 设置两条曲线的标签
+        invert_y=True  # 深度向下，y轴反向
+    )
+
+    # 显示图形
+    show(fig)
+
+    # 打印插件的帮助信息
+    print(help_plot("vel1d"))  # 根据插件 id 调用 help_plot 获取帮助信息
+
+
 def main() -> None:
     """运行示例测试。"""
-    test_ccf_wiggle_plot()
-    test_beamforming_polar_heatmap()
-    test_dispersion_energy_plot()
+    # test_ccf_wiggle_plot()
+    # test_beamforming_polar_heatmap()
+    # test_dispersion_energy_plot()
     test_seismic_waveform_plot()
+    # test_velocity_structure_1d_plot()
 
 
 if __name__ == "__main__":
