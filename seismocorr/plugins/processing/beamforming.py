@@ -42,6 +42,23 @@ class BeamformingResult:
     meta: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class BackprojectionResult:
+    """
+    反投影输出结果容器。
+
+    Attributes:
+        power: 反投影能量图 (n_grid,)
+        freqs_hz: 参与计算的频率数组 (Nf_band,)
+        frame_power: 可选的逐帧能量 (n_frames, n_grid)；若未请求则为 None
+        meta: 元数据
+    """
+    power: np.ndarray
+    freqs_hz: np.ndarray
+    frame_power: np.ndarray | None
+    meta: Dict[str, Any]
+
+
 class Beamformer:
     """Frequency-domain delay-and-sum (Bartlett) beamformer.
 
@@ -129,7 +146,7 @@ class Beamformer:
         if self.frame_len_s <= 0 or self.hop_s <= 0:
             raise ValueError("frame_len_s 与 hop_s 必须为正数")
 
-    def beamform(
+    def delay_and_sum(
         self,
         data: np.ndarray,
         xy_m: np.ndarray,
@@ -254,6 +271,133 @@ class Beamformer:
             slowness_s_per_m=slowness_s_per_m,
             power=power,
             freqs_hz=freqs_band,
+            meta=meta,
+        )
+
+    def backproject(
+        self,
+        data: np.ndarray,
+        travel_times_s: np.ndarray,
+        *,
+        weights: np.ndarray | None = None,
+        return_frame_power: bool = False,
+        chunk_size: int = 256,
+    ) -> BackprojectionResult:
+        """
+        频域反投影（Backprojection）：按给定走时表对齐后做相干叠加，输出空间能量图。
+
+        Args:
+            data: (n_chan, n_samples)
+            travel_times_s: 走时表，形状 (n_grid, n_chan)，单位秒
+            weights: (n_chan,) 可选通道权重（如 SNR 权重/距离权重），默认全 1
+            return_frame_power: 是否返回逐帧能量 (n_frames, n_grid)
+            chunk_size: 网格分块大小，避免一次性 phase 占用过大内存
+
+        Returns:
+            BackprojectionResult:
+                power: (n_grid,)
+                freqs_hz: (Nf_band,)
+                frame_power: (n_frames, n_grid) 或 None
+                meta: 参数字典
+        """
+        data = np.asarray(data)
+        if data.ndim != 2:
+            raise ValueError("data 必须是二维数组 (n_chan, n_samples)")
+        n_chan, n_samp = data.shape
+        if n_chan < 1 or n_samp < 2:
+            raise ValueError("data 尺寸不合法")
+
+        travel_times_s = np.asarray(travel_times_s, dtype=float)
+        if travel_times_s.ndim != 2:
+            raise ValueError("travel_times_s 必须是二维数组 (n_grid, n_chan)")
+        n_grid, n_chan_tt = travel_times_s.shape
+        if n_chan_tt != n_chan:
+            raise ValueError("travel_times_s 的第二维必须等于 n_chan")
+
+        if weights is None:
+            w = np.ones((n_chan,), dtype=float)
+        else:
+            w = np.asarray(weights, dtype=float).reshape(-1)
+            if w.size != n_chan:
+                raise ValueError("weights 必须是 (n_chan,)")
+
+        frame_len = int(round(self.frame_len_s * self.fs))
+        hop = int(round(self.hop_s * self.fs))
+        if frame_len <= 1 or hop <= 0:
+            raise ValueError("由 frame_len_s/hop_s 计算得到的步长不合法")
+        if n_samp < frame_len:
+            raise ValueError("n_samples < frame_len")
+
+        win = get_window(self.window, frame_len, fftbins=True).astype(float)
+
+        freqs = rfftfreq(frame_len, d=1.0 / self.fs)
+        band = (freqs >= self.fmin) & (freqs <= self.fmax)
+        freqs_band = freqs[band]
+        if freqs_band.size == 0:
+            raise ValueError("频带内无可用频点")
+
+        n_frames = 1 + (n_samp - frame_len) // hop
+        if n_frames < 1:
+            raise ValueError("无法形成有效分帧")
+        
+        spectra = np.empty((n_chan, n_frames, freqs_band.size), dtype=np.complex128)
+        for chan_idx in range(n_chan):
+            frames = self._frame_1d(data[chan_idx], frame_len, hop)
+            frames *= win[None, :]
+            spectra[chan_idx] = rfft(frames, axis=-1)[:, band]
+
+        if self.whiten:
+            amp = np.sqrt(np.mean(np.abs(spectra) ** 2, axis=1, keepdims=True)) + self.eps
+            spectra /= amp
+
+        spectra *= w[:, None, None]
+
+        spectra_tcf = np.transpose(spectra, (1, 0, 2))
+
+        omega = 2.0 * np.pi * freqs_band  # (f,)
+
+        power = np.zeros((n_grid,), dtype=float)
+        frame_power = np.zeros((n_frames, n_grid), dtype=float) if return_frame_power else None
+
+        for g0 in range(0, n_grid, int(chunk_size)):
+            g1 = min(n_grid, g0 + int(chunk_size))
+            tau = travel_times_s[g0:g1, :] 
+
+            mask = np.isfinite(tau)  
+            tau0 = np.where(mask, tau, 0.0)
+            phase = np.exp(1j * tau0[:, :, None] * omega[None, None, :])
+            phase *= mask[:, :, None]  # 无效通道不贡献
+            phase = np.exp(1j * tau[:, :, None] * omega[None, None, :])
+
+            beam = np.einsum("tcf,gcf->tgf", spectra_tcf, phase, optimize=True)
+
+            if return_frame_power:
+                fp = np.mean(np.abs(beam) ** 2, axis=-1)
+                frame_power[:, g0:g1] = fp
+
+            p = np.mean(np.mean(np.abs(beam) ** 2, axis=0), axis=-1)
+            power[g0:g1] = p
+
+        meta = {
+            "method": "backprojection_frequency_domain",
+            "fs": self.fs,
+            "fmin": self.fmin,
+            "fmax": self.fmax,
+            "frame_len_s": self.frame_len_s,
+            "hop_s": self.hop_s,
+            "window": self.window,
+            "whiten": self.whiten,
+            "n_frames": int(n_frames),
+            "n_chan": int(n_chan),
+            "n_grid": int(n_grid),
+            "travel_time_convention": "phase = exp(+j*omega*tau) for alignment",
+            "recommendation": "use relative travel times to reduce model bias",
+        }
+
+        return BackprojectionResult(
+            power=power,
+            freqs_hz=freqs_band,
+            frame_power=frame_power,
             meta=meta,
         )
 
