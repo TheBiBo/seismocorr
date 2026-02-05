@@ -12,14 +12,21 @@ def _build_ccf_wiggle(
     *,
     title: Optional[str] = None,
     normalize: bool = True,
+    normalize_method: Optional[str] = None,
+    norm_method: str = "trace",
     clip: Optional[float] = None,
     scale: float = 1.0,
+    dy: Optional[float] = None,
+    excursion: float = 2.0,
+    bias: float = 0.0,
+    fill_mode: Optional[str] = "pos",
+    fill_alpha: float = 0.10,
+    trace_step: int = 1,
+    ytick_step: int = 5,
     x_label: str = "Lag (s)",
     y_label: str = "Trace index",
-
     highlights=None,
     sort=None,
-
     show_zero_line: bool = False,
 ) -> PlotSpec:
     """
@@ -43,43 +50,47 @@ def _build_ccf_wiggle(
     if lags.ndim != 1 or lags.shape[0] != cc.shape[1]:
         raise ValueError("lags 必须是一维，且长度等于 cc.shape[1]")
 
-    cc_disp = cc.copy()
-
-    # 每道归一化
-    if normalize:
-        denom = np.max(np.abs(cc_disp), axis=1, keepdims=True)
-        denom[denom == 0] = 1.0
-        cc_disp = cc_disp / denom
-
-    # 裁剪
-    if clip is not None:
-        cc_disp = np.clip(cc_disp, -abs(clip), abs(clip))
+    if normalize_method is not None:
+        normalize_style = normalize_method
+    else:
+        normalize_style = "max" if normalize else None
 
     wiggle = Layer(
         type="wiggle",
         data={
             "x": lags,
-            "traces": cc_disp,
+            "traces": cc,
             "labels": labels,
             "highlights": highlights,
             "sort": sort,
         },
         style={
+            "dy": float(scale if dy is None else dy),
             "scale": float(scale),
-            "linewidth": 0.8,
-            "alpha": 1.0,
+            "excursion": float(excursion),
+            "bias": float(bias),
+            "norm_method": str(norm_method),
+            "normalize": normalize_style,
+            "clip": clip,
+            "linewidth": 0.6,
+            "alpha": 0.85,
+            "color": "k",
+            "fill_mode": fill_mode,
+            "fill_alpha": float(fill_alpha),
+            "ytick_step": int(ytick_step),
+            "trace_step": int(trace_step),
+            "zero_line": bool(show_zero_line),
         },
         name="CCF",
     )
 
     layers = [wiggle]
 
-    # lag=0 竖线（可选）
     if show_zero_line:
         v0 = Layer(
             type="vlines",
             data={"xs": [0.0]},
-            style={"linewidth": 1.0, "alpha": 0.6},
+            style={"linewidth": 0.8, "alpha": 0.8},
             name="lag=0",
         )
         layers.append(v0)
@@ -99,7 +110,6 @@ PLUGINS = [
         title="互相关多道 Wiggle",
         build=_build_ccf_wiggle,
         default_layout={"figsize": (10, 6)},
-
         data_spec={
             "type": "dict",
             "required_keys": {
@@ -110,37 +120,43 @@ PLUGINS = [
                 "labels": "list[str], length n_tr 道名/台站名（<=60 时显示在 y 轴）",
             },
             "notes": [
-                "normalize=True 时会对每道按最大绝对值归一化",
-                "clip 可在归一化后做幅值裁剪",
-                "highlights 的 trace 索引默认按原始道号（若启用 sort，会自动映射到新顺序）",
+                "normalize 控制是否启用归一化；normalize_method 可指定 'max'/'p95'/'rms'",
+                "norm_method 可选 'trace'(逐道) 或 'stream'(全局)",
+                "excursion 控制单道最大跨越的道间距倍数",
+                "fill_mode 支持 variable-area 填充：pos/neg/both",
+                "trace_step 可抽稀绘制减少拥挤",
             ],
         },
-
         params={
             "title": Param("str", None, "图标题"),
-            "normalize": Param("bool", True, "是否对每道归一化（推荐 True）"),
-            "clip": Param("float", None, "幅值裁剪（归一化后），如 0.8"),
-            "scale": Param("float", 1.0, "wiggle 幅值缩放系数"),
-            "x_label": Param("str", "Lag (s)", "x轴标签"),
-            "y_label": Param("str", "Trace index", "y轴标签"),
-
-            # ✅默认不显示 lag=0 中间线
-            "show_zero_line": Param("bool", False, "是否显示 lag=0 的竖线（中间线）"),
-
+            "normalize": Param("bool", True, "是否归一化（默认 True）"),
+            "normalize_method": Param("str", None, "归一化幅度统计：'max'/'p95'/'rms'（优先于 normalize）"),
+            "norm_method": Param("str", "trace", "归一化范围：'trace' 或 'stream'"),
+            "clip": Param("float", None, "归一化后限幅阈值"),
+            "scale": Param("float", 1.0, "垂直缩放系数（兼容旧参数）"),
+            "dy": Param("float", None, "垂直缩放系数（优先于 scale）"),
+            "excursion": Param("float", 2.0, "单道最大跨越道间距倍数"),
+            "bias": Param("float", 0.0, "填充阈值偏置（归一化幅度单位）"),
+            "fill_mode": Param("str", "pos", "填充方式：None/'pos'/'neg'/'both'"),
+            "fill_alpha": Param("float", 0.10, "填充透明度"),
+            "trace_step": Param("int", 1, "抽稀绘制步长（每隔 N 道画一条）"),
+            "ytick_step": Param("int", 5, "y 轴刻度抽样步长"),
+            "x_label": Param("str", "x", "x 轴标签"),
+            "y_label": Param("str", "y", "y 轴标签"),
+            "show_zero_line": Param("bool", False, "是否显示 x=0 的参考线"),
             "highlights": Param(
                 "list[dict]",
                 None,
-                "高亮配置：对指定道、指定时间段叠加彩色线段（默认红色、默认全时段）。",
+                "高亮配置：对指定道、指定时间段叠加彩色线段。",
                 item_schema={
                     "trace": Param("int", None, "道号（0-based，必填）", required=True),
                     "t0": Param("float", None, "起始时间（可选，缺省=全时段）"),
                     "t1": Param("float", None, "终止时间（可选，缺省=全时段）"),
-                    "color": Param("str", None, "高亮颜色（默认 red）"),
-                    "linewidth": Param("float", None, "高亮线宽（缺省=底线线宽）"),
-                    "alpha": Param("float", 1.0, "高亮透明度（默认 1.0）"),
+                    "color": Param("str", None, "高亮颜色"),
+                    "linewidth": Param("float", None, "高亮线宽"),
+                    "alpha": Param("float", 1.0, "高亮透明度"),
                 },
             ),
-
             "sort": Param(
                 "dict",
                 None,

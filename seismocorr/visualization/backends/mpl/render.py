@@ -103,13 +103,25 @@ def render(spec: PlotSpec) -> FigureHandle:
                 ax,
                 layer.data["x"],
                 layer.data["traces"],
+                dy=layer.style.get("dy"),
                 scale=layer.style.get("scale", 1.0),
-                linewidth=layer.style.get("linewidth", 0.8),
-                alpha=layer.style.get("alpha", 1.0),
+                excursion=layer.style.get("excursion", 2.0),
+                bias=layer.style.get("bias", 0.0),
+                norm_method=layer.style.get("norm_method", "trace"),
+                normalize=layer.style.get("normalize", "p95"),
+                clip=layer.style.get("clip", 2.5),
+                linewidth=layer.style.get("linewidth", 0.6),
+                alpha=layer.style.get("alpha", 0.85),
                 labels=layer.data.get("labels"),
-                color="k",
+                color=layer.style.get("color", "k"),
+                fill_mode=layer.style.get("fill_mode", "pos"),
+                fill_alpha=layer.style.get("fill_alpha", 0.10),
                 highlights=layer.data.get("highlights"),
                 sort=layer.data.get("sort"),
+                ytick_step=layer.style.get("ytick_step", 5),
+                trace_step=layer.style.get("trace_step", 1),
+                zero_line=layer.style.get("zero_line", True),
+                zero_line_kwargs=layer.style.get("zero_line_kwargs"),
             )
             extra.setdefault("artists", []).append(artist)
             continue
@@ -141,18 +153,29 @@ def render(spec: PlotSpec) -> FigureHandle:
 
         raise ValueError(f"mpl 后端不支持的 layer.type: {layer.type!r}。")
 
-    ax.set_title(layout.get("title", "") or "")
-    ax.set_xlabel(layout.get("x_label", "") or "")
-    ax.set_ylabel(layout.get("y_label", "") or "")
+    ax.set_title(layout.get("title", "") or "", fontsize=14)
+    ax.set_xlabel(layout.get("x_label", "") or "", fontsize=14)
+    ax.set_ylabel(layout.get("y_label", "") or "", fontsize=14)
+
     if layout.get("x_lim"):
         ax.set_xlim(layout.get("x_lim"))
     else:
-        ax.set_xlim(ax.get_xlim()) 
+        ax.set_xlim(ax.get_xlim())
+
+    invert_y = bool(layout.get("invert_y", False))
 
     if layout.get("y_lim"):
-        ax.set_ylim(layout.get("y_lim"))
+        y0, y1 = layout.get("y_lim")
+        if invert_y:
+            ax.set_ylim([y1, y0])
+        else:
+            ax.set_ylim([y0, y1])
     else:
-        ax.set_ylim(ax.get_ylim()) 
+        y0, y1 = ax.get_ylim()
+        if invert_y:
+            ax.set_ylim([y1, y0])
+        else:
+            ax.set_ylim([y0, y1])
 
     if any(layer.name for layer in spec.layers):
         handles, labels = ax.get_legend_handles_labels()
