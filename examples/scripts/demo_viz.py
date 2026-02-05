@@ -44,8 +44,8 @@ def generate_ccf_data(n_tr: int = 40, n_lags: int = 401, *, seed: int = 0) -> Di
 
 
 def generate_beamforming_data(
-    n_azimuth: int = 100,
-    n_radius: int = 50,
+    n_azimuth: int = 12,
+    n_radius: int = 10,
     *,
     seed: int = 1,
 ) -> Dict[str, Any]:
@@ -65,7 +65,7 @@ def generate_beamforming_data(
     rng = np.random.default_rng(seed)
 
     azimuth_deg = np.linspace(0.0, 360.0, int(n_azimuth))
-    slowness_s_per_m = np.linspace(0.1, 1.0, int(n_radius))
+    slowness_s_per_m = np.linspace(0.0, 1.0, int(n_radius))
 
     # 原始生成是 (n_azimuth, n_radius)，插件约定这里用 (n_radius, n_azimuth)
     power = rng.random((int(n_azimuth), int(n_radius))).T
@@ -163,6 +163,47 @@ def generate_velocity_data() -> np.ndarray:
     return data
 
 
+def generate_vel2d_data(
+    n_d: int = 60,          # distance 采样点数
+    n_t: int = 25,          # 层数（深度方向）
+    max_depth_m: float = 2000.0,
+    *,
+    seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    生成模拟 2D 速度结构数据（dict 格式）：
+      - Velocities: (n_t, n_d)
+      - thickness:  (n_t,)
+      - distance:   (n_d,)
+    """
+    rng = np.random.default_rng(seed)
+
+    # distance 轴（km）
+    distance = np.linspace(0.0, 30.0, int(n_d))
+
+    # thickness（m）：这里用随机扰动后再归一化到 max_depth_m
+    thickness_raw = rng.uniform(0.8, 1.2, size=int(n_t))
+    thickness = thickness_raw / thickness_raw.sum() * float(max_depth_m)
+
+    # 深度中心（m），用于合成一个随深度增大、随距离有起伏的速度场
+    depth_edges = np.concatenate([[0.0], np.cumsum(thickness)])
+    depth_centers = 0.5 * (depth_edges[:-1] + depth_edges[1:])  # (n_t,)
+
+    # 合成速度场 Velocities (n_t, n_d)
+    # 基础：随深度线性增加
+    v0 = 1500.0 + 0.6 * depth_centers[:, None]  # (n_t,1)
+
+    # 距离方向变化：小幅线性+正弦扰动
+    lateral = 40.0 * np.sin(distance[None, :] / 4.0) + 5.0 * distance[None, :]
+
+    # 加一点随机扰动（可选）
+    noise = rng.normal(0.0, 15.0, size=(int(n_t), int(n_d)))
+
+    Velocities = v0 + lateral + noise
+
+    return {"Velocities": Velocities, "thickness": thickness, "distance": distance}
+
+
 # =========================
 # 绘图测试
 # =========================
@@ -175,20 +216,29 @@ def test_ccf_wiggle_plot() -> None:
     fig = plot(
         "ccf.wiggle",
         data={"cc": ccf["cc"], "lags": ccf["lags"], "labels": ccf["labels"]},
-        normalize=True,
-        clip=0.9,
         sort={
             "by": ccf["dist_km"],
             "ascending": True,
-            "y_mode": "index",
+            "y_mode": "distance",
             "label": "Distance (km)",
         },
         highlights=[
             {"trace": 5, "t0": -2.0, "t1": 2.0},
-            {"trace": 10, "color": "blue"},
-            {"trace": 12, "t0": 1.0, "t1": 3.5, "color": "#ff00ff", "linewidth": 3},
+            {"trace": 10, "color": "royalblue"},
+            {"trace": 12, "t0": 1.0, "t1": 3.5, "color": "#ff00ff", "linewidth": 2.5},
         ],
-        scale=5,
+        normalize=True,
+        normalize_method="p95",
+        clip=2.5,
+        norm_method="trace",
+        dy=1.0,
+        excursion=2.0,
+        bias=0.0,
+        fill_mode="pos",
+        fill_alpha=0.5,
+        ytick_step=5,
+        trace_step=1,
+        show_zero_line=False,
     )
 
     show(fig)
@@ -286,14 +336,97 @@ def test_velocity_structure_1d_plot() -> None:
     print(help_plot("vel1d"))  # 根据插件 id 调用 help_plot 获取帮助信息
 
 
+def test_velocity_structure_2d_plot() -> None:
+    """测试并绘制 2D 速度结构图（vel2d）：对比不同插值方法/强度，并检查深度头尾是否补齐。"""
+    set_default_backend("mpl")
+
+    data = generate_vel2d_data(n_d=80, n_t=30, max_depth_m=2500.0, seed=7)
+
+    fig0 = plot(
+        "vel2d",
+        data=data,
+        title="vel2d | no interp (baseline)",
+        x_label="Distance (km)",
+        y_label="Depth (m)",
+        cmap="jet",
+        colorbar_label="Velocity (m/s)",
+        invert_y=False,
+        interp=False,
+        interp_method="none",
+    )
+    show(fig0)
+
+    fig1 = plot(
+        "vel2d",
+        data=data,
+        title="vel2d | linear interp (strength=3)",
+        x_label="Distance (km)",
+        y_label="Depth (m)",
+        cmap="jet",
+        colorbar_label="Velocity (m/s)",
+        invert_y=False,
+        interp=True,
+        interp_method="linear",
+        interp_strength=3.0,
+    )
+    show(fig1)
+
+    fig2 = plot(
+        "vel2d",
+        data=data,
+        title="vel2d | nearest interp (strength=6)",
+        x_label="Distance (km)",
+        y_label="Depth (m)",
+        cmap="jet",
+        colorbar_label="Velocity (m/s)",
+        invert_y=False,
+        interp=True,
+        interp_method="nearest",
+        interp_strength=6.0,
+    )
+    show(fig2)
+
+    fig3 = plot(
+        "vel2d",
+        data=data,
+        title="vel2d | linear interp (dx=0.2 km, dy=5 m)",
+        x_label="Distance (km)",
+        y_label="Depth (m)",
+        cmap="jet",
+        colorbar_label="Velocity (m/s)",
+        invert_y=False,
+        interp=True,
+        interp_method="linear",
+        dx_km=0.2,
+        dy_m=5.0,
+    )
+    show(fig3)
+
+    fig4 = plot(
+        "vel2d",
+        data=data,
+        title="vel2d | cubic interp (strength=4) [requires scipy]",
+        x_label="Distance (km)",
+        y_label="Depth (m)",
+        cmap="jet_r",
+        colorbar_label="Velocity (m/s)",
+        invert_y=True,
+        interp=True,
+        interp_method="cubic",
+        interp_strength=4.0,
+    )
+    show(fig4)
+
+    print(help_plot("vel2d"))
+
+
 def main() -> None:
     """运行示例测试。"""
     # test_ccf_wiggle_plot()
     # test_beamforming_polar_heatmap()
     # test_dispersion_energy_plot()
-    test_seismic_waveform_plot()
+    # test_seismic_waveform_plot()
     # test_velocity_structure_1d_plot()
-
-
+    test_velocity_structure_2d_plot()
 if __name__ == "__main__":
     main()
